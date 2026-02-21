@@ -2,7 +2,7 @@ import express from "express";
 import { v4 as uuidv4 } from "uuid";
 import { pool } from "../src/db.js";
 import { evaluateIntent } from "../services/riskEngine.js";
-import { sha256 } from "../utils/hash.js";
+import { sha256 } from "../src/utils/hash.js";
 
 const router = express.Router();
 
