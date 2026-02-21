@@ -1,79 +1,200 @@
 import express from "express";
 import { v4 as uuidv4 } from "uuid";
+import { pool } from "../src/db.js";
 import { evaluateIntent } from "../services/riskEngine.js";
-import { computeLedger } from "../services/ledgerEngine.js";
+import { sha256 } from "../utils/hash.js";
 
 const router = express.Router();
 
-router.post("/evaluate", async (req, res) => {
-  const { intent, scenario } = req.body;
+/**
+ * POST /lab/run
+ * Core Execution Governance Lab endpoint
+ */
+router.post("/lab/run", async (req, res) => {
+  try {
+    const runId = uuidv4();
+    const { intent = {}, scenario = {} } = req.body;
 
-  if (!intent || !scenario) {
-    return res.status(400).json({ error: "intent and scenario required" });
-  }
+    if (!intent.amountUsd) {
+      return res.status(400).json({
+        error: "intent.amountUsd is required"
+      });
+    }
 
-  const db = req.app.locals.db;
-  const runId = uuidv4();
+    const attemptedValue = Number(intent.amountUsd) || 0;
 
-  const result = evaluateIntent({ intent, scenario });
+    // ─────────────────────────────────────────────
+    // Baseline World (No Governance)
+    // ─────────────────────────────────────────────
 
-  const ledger = computeLedger({
-    intent,
-    decision: result.decision,
-    scenario,
-  });
+    const baselineDecision = "ALLOW";
+    const baselineRisk = "LOW";
 
-  await db.query(
-    `
-    INSERT INTO sandbox_runs (
-      id,
-      attempted_value_usd,
-      scenario,
+    // ─────────────────────────────────────────────
+    // Governed World
+    // ─────────────────────────────────────────────
+
+    const evaluation = evaluateIntent({ intent, scenario });
+
+    const decision = evaluation.decision;
+    const riskLevel = evaluation.risk;
+    const reasons = evaluation.reasons;
+    const integrityFailure = evaluation.integrityFailure;
+
+    // ─────────────────────────────────────────────
+    // Cost-to-Outcome Calculation
+    // ─────────────────────────────────────────────
+
+    const isAttack = Object.values(scenario).some(Boolean);
+
+    const preventedLoss =
+      decision === "DENY" && isAttack ? attemptedValue : 0;
+
+    const frictionCost =
+      decision === "STEP_UP" ? 25 : 0;
+
+    const falsePositiveCost =
+      decision === "DENY" && !isAttack ? 50 : 0;
+
+    const netSecurityValue =
+      preventedLoss - frictionCost - falsePositiveCost;
+
+    // ─────────────────────────────────────────────
+    // Policy Metadata
+    // ─────────────────────────────────────────────
+
+    const policyId = "DEFAULT_V1";
+    const policyVersion = 1;
+    const policyHash = sha256(`${policyId}_${policyVersion}`);
+
+    // ─────────────────────────────────────────────
+    // Persist lab_runs
+    // ─────────────────────────────────────────────
+
+    await pool.query(
+      `
+      INSERT INTO lab_runs (
+        id,
+        policy_id,
+        policy_version,
+        policy_hash,
+        intent,
+        scenario,
+        decision,
+        risk,
+        reasons,
+        baseline_decision,
+        baseline_risk,
+        attempted_value_usd,
+        prevented_loss_usd,
+        friction_cost_usd,
+        false_positive_cost_usd,
+        net_security_value_usd
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
+      )
+      `,
+      [
+        runId,
+        policyId,
+        policyVersion,
+        policyHash,
+        intent,
+        scenario,
+        decision,
+        riskLevel,
+        reasons,
+        baselineDecision,
+        baselineRisk,
+        attemptedValue,
+        preventedLoss,
+        frictionCost,
+        falsePositiveCost,
+        netSecurityValue
+      ]
+    );
+
+    // ─────────────────────────────────────────────
+    // Write Hash-Chained Audit Event
+    // ─────────────────────────────────────────────
+
+    const prevResult = await pool.query(
+      `SELECT event_hash FROM lab_audit_events
+       WHERE run_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [runId]
+    );
+
+    const prevHash = prevResult.rows[0]?.event_hash || null;
+
+    const eventPayload = {
       decision,
-      risk,
+      risk: riskLevel,
       reasons,
-      prevented_loss_usd,
-      friction_cost_usd,
-      net_security_value_usd
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    `,
-    [
+      integrityFailure
+    };
+
+    const eventHash = sha256(
+      JSON.stringify(eventPayload) + (prevHash || "")
+    );
+
+    await pool.query(
+      `
+      INSERT INTO lab_audit_events (
+        id,
+        run_id,
+        event_type,
+        message,
+        data,
+        prev_hash,
+        event_hash
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `,
+      [
+        uuidv4(),
+        runId,
+        "EXECUTION_DECISION",
+        "Execution governance evaluated",
+        eventPayload,
+        prevHash,
+        eventHash
+      ]
+    );
+
+    // ─────────────────────────────────────────────
+    // Response
+    // ─────────────────────────────────────────────
+
+    return res.json({
       runId,
-      intent.amountUsd,
-      JSON.stringify(scenario),
-      result.decision,
-      result.risk,
-      JSON.stringify(result.reasons),
-      ledger.prevented_loss_usd,
-      ledger.friction_cost_usd,
-      ledger.net_security_value_usd,
-    ]
-  );
+      baseline: {
+        decision: baselineDecision,
+        risk: baselineRisk
+      },
+      governed: {
+        decision,
+        risk: riskLevel,
+        reasons,
+        integrityFailure
+      },
+      economics: {
+        attemptedValue,
+        preventedLoss,
+        frictionCost,
+        falsePositiveCost,
+        netSecurityValue
+      }
+    });
 
-  return res.json({
-    run_id: runId,
-    decision: result.decision,
-    risk: result.risk,
-    reasons: result.reasons,
-    ledger,
-  });
-});
-
-router.get("/dashboard", async (req, res) => {
-  const db = req.app.locals.db;
-
-  const { rows } = await db.query(`
-    SELECT
-      COUNT(*) AS total_runs,
-      COALESCE(SUM(attempted_value_usd),0) AS total_attempted,
-      COALESCE(SUM(prevented_loss_usd),0) AS total_prevented,
-      COALESCE(SUM(friction_cost_usd),0) AS total_friction,
-      COALESCE(SUM(net_security_value_usd),0) AS net_security_value
-    FROM sandbox_runs
-  `);
-
-  res.json(rows[0]);
+  } catch (err) {
+    console.error("LAB_RUN_ERROR:", err);
+    return res.status(500).json({
+      error: "Execution Governance Lab run failed"
+    });
+  }
 });
 
 export default router;
